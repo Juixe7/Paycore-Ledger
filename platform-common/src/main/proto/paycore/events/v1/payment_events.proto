@@ -1,0 +1,68 @@
+syntax = "proto3";
+
+package paycore.events.v1;
+
+option java_multiple_files = true;
+option java_package = "com.paycore.common.events.v1";
+option java_outer_classname = "PaymentEventsProto";
+
+import "google/protobuf/timestamp.proto";
+
+// Event contract (Section 5.1):
+// Events are the second public API of the system, so they are versioned and checked in CI.
+// Rules: only add optional fields, never reuse a field number, and fail CI on any incompatible change.
+message PaymentEvent {
+  string event_id = 1; // UUIDv7, the consumer dedupe key
+  string event_type = 2; // payment.authorized, payment.captured, payment.failed, refund.processed, payout.created
+  uint32 schema_version = 3;
+  string payment_id = 4; // Kafka message key
+  string merchant_id = 5;
+  uint64 event_seq = 6; // per payment, gapless
+  google.protobuf.Timestamp occurred_at = 7;
+  map<string, string> trace_context = 8; // W3C traceparent, carried across the bus
+
+  oneof payload {
+    PaymentAuthorized authorized = 20;
+    PaymentCaptured captured = 21;
+    RefundProcessed refunded = 22;
+    PayoutCreated payout = 23;
+    PaymentFailed failed = 24;
+  }
+}
+
+message PaymentAuthorized {
+  int64 amount = 1;
+  string currency = 2;
+  string psp_ref = 3;
+}
+
+message PaymentCaptured {
+  int64 captured_amount = 1;
+  int64 fee_amount = 2;
+  int64 net_merchant_amount = 3;
+  string currency = 4;
+  string psp_ref = 5;
+  string ledger_txn_id = 6;
+}
+
+message RefundProcessed {
+  string refund_id = 1;
+  int64 refund_amount = 2;
+  int64 total_refunded_amount = 3;
+  string currency = 4;
+  string ledger_txn_id = 5;
+}
+
+message PayoutCreated {
+  string payout_id = 1;
+  int64 amount = 2;
+  string currency = 3;
+  string ledger_txn_id = 4;
+}
+
+message PaymentFailed {
+  int64 amount = 1;
+  string currency = 2;
+  string psp_ref = 3;
+  string reason = 4;
+}
