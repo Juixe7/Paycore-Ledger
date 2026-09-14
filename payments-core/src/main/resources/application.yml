@@ -1,0 +1,65 @@
+server:
+  port: ${PORT:8081}
+  tomcat:
+    accept-count: 1024
+    max-connections: 2048
+
+spring:
+  application:
+    name: payments-core
+  threads:
+    virtual:
+      enabled: ${VIRTUAL_THREADS_ENABLED:true}
+  datasource:
+    url: ${DB_URL:jdbc:postgresql://localhost:5432/paycore}
+    username: ${DB_USER:paycore}
+    password: ${DB_PASSWORD:paycore}
+    hikari:
+      maximum-pool-size: ${HIKARI_MAX_POOL_SIZE:32}
+      minimum-idle: ${HIKARI_MIN_IDLE:8}
+      connection-timeout: 3000
+      auto-commit: true
+      transaction-isolation: TRANSACTION_READ_COMMITTED
+  flyway:
+    enabled: true
+    locations: classpath:db/migration
+    table: flyway_schema_history_payments_core
+    baseline-on-migrate: true
+  data:
+    redis:
+      host: ${REDIS_HOST:localhost}
+      port: ${REDIS_PORT:6379}
+      timeout: 500ms
+  kafka:
+    bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:9092}
+    producer:
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.apache.kafka.common.serialization.ByteArraySerializer
+    consumer:
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      value-deserializer: org.apache.kafka.common.serialization.ByteArrayDeserializer
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,prometheus,metrics
+  endpoint:
+    health:
+      probes:
+        enabled: true
+
+paycore:
+  redis:
+    enabled: ${REDIS_ENABLED:false}
+  outbox:
+    relay-enabled: ${OUTBOX_RELAY_ENABLED:false}
+  ledger:
+    sharded-fee-accounts: ${SHARDED_FEE_ACCOUNTS:false}
+  psp:
+    base-url: ${PSP_BASE_URL:}
+    timeout-ms: ${PSP_TIMEOUT_MS:1500}
+  security:
+    allow-local-webhooks: ${ALLOW_LOCAL_WEBHOOKS:false}
+  resolver:
+    interval-ms: ${RESOLVER_INTERVAL_MS:5000}
