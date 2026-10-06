@@ -1,0 +1,214 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: paycore
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: payments-core
+  namespace: paycore
+  labels:
+    app: payments-core
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: payments-core
+  template:
+    metadata:
+      labels:
+        app: payments-core
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+      containers:
+        - name: payments-core
+          image: paycore/payments-core:latest
+          ports:
+            - containerPort: 8080
+          env:
+            - name: SPRING_DATASOURCE_URL
+              value: jdbc:postgresql://paycore-pg-rw.paycore.svc.cluster.local:5432/paycore
+            - name: SPRING_KAFKA_BOOTSTRAP_SERVERS
+              value: redpanda.paycore.svc.cluster.local:9092
+            - name: PAYCORE_LEDGER_SHARDED_FEE_ACCOUNTS
+              value: "true"
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "512Mi"
+            limits:
+              cpu: "1000m"
+              memory: "1Gi"
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 15
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 5
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: payments-core-hpa
+  namespace: paycore
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: payments-core
+  minReplicas: 2
+  maxReplicas: 6
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: payments-core-pdb
+  namespace: paycore
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: payments-core
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: read-model-service
+  namespace: paycore
+  labels:
+    app: read-model-service
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: read-model-service
+  template:
+    metadata:
+      labels:
+        app: read-model-service
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+      containers:
+        - name: read-model-service
+          image: paycore/read-model-service:latest
+          ports:
+            - containerPort: 8083
+          env:
+            - name: SPRING_DATASOURCE_URL
+              value: jdbc:postgresql://paycore-pg-ro.paycore.svc.cluster.local:5432/paycore
+            - name: PAYCORE_READMODEL_KAFKA_ENABLED
+              value: "true"
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8083
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: 8083
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: webhook-service
+  namespace: paycore
+  labels:
+    app: webhook-service
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: webhook-service
+  template:
+    metadata:
+      labels:
+        app: webhook-service
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+      containers:
+        - name: webhook-service
+          image: paycore/webhook-service:latest
+          ports:
+            - containerPort: 8082
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8082
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: 8082
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gateway
+  namespace: paycore
+  labels:
+    app: gateway
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: gateway
+  template:
+    metadata:
+      labels:
+        app: gateway
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+      containers:
+        - name: gateway
+          image: paycore/gateway:latest
+          ports:
+            - containerPort: 8090
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8090
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: 8090
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: payments-core-network-policy
+  namespace: paycore
+spec:
+  podSelector:
+    matchLabels:
+      app: payments-core
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: gateway
+      ports:
+        - protocol: TCP
+          port: 8080

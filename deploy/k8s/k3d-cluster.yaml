@@ -1,0 +1,29 @@
+apiVersion: k3d.io/v1alpha5
+kind: Simple
+metadata:
+  name: paycore-full
+servers: 1
+agents: 2
+image: rancher/k3s:v1.30.4-k3s1
+ports:
+  - port: 8090:30090
+    nodeFilters:
+      - loadbalancer
+  - port: 8080:30080
+    nodeFilters:
+      - loadbalancer
+  - port: 3000:30300
+    nodeFilters:
+      - loadbalancer
+  - port: 9090:30900
+    nodeFilters:
+      - loadbalancer
+  - port: 16686:30686
+    nodeFilters:
+      - loadbalancer
+options:
+  k3s:
+    extraArgs:
+      - arg: --disable=traefik
+        nodeFilters:
+          - server:*

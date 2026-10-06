@@ -1,0 +1,43 @@
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: paycore-pg
+  namespace: paycore
+spec:
+  instances: 2
+  imageName: ghcr.io/cloudnative-pg/postgresql:16.4
+  primaryUpdateStrategy: unsupervised
+  enableSuperuserAccess: false
+
+  postgresql:
+    parameters:
+      max_connections: "300"
+      shared_buffers: "256MB"
+      wal_level: "logical"
+      max_wal_senders: "10"
+      max_replication_slots: "10"
+      synchronous_commit: "on"
+      lock_timeout: "2000ms"
+      idle_in_transaction_session_timeout: "10000ms"
+
+  bootstrap:
+    initdb:
+      database: paycore
+      owner: paycore
+
+  storage:
+    size: 5Gi
+
+  monitoring:
+    enablePodMonitor: true
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: paycore-pg-pdb
+  namespace: paycore
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      cnpg.io/cluster: paycore-pg

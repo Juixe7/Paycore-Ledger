@@ -1,0 +1,77 @@
+{
+  "title": "PayCore — Payment Service & Double-Entry Ledger Overview",
+  "uid": "paycore-overview",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "5s",
+  "panels": [
+    {
+      "id": 1,
+      "title": "Ledger Invariant Drift (Paise — Must Be 0)",
+      "type": "stat",
+      "targets": [
+        {
+          "expr": "paycore_ledger_invariant_drift_paise",
+          "legendFormat": "Drift (paise)"
+        }
+      ],
+      "gridPos": { "h": 6, "w": 6, "x": 0, "y": 0 }
+    },
+    {
+      "id": 2,
+      "title": "Outbox Unpublished Backlog & Oldest Age (s)",
+      "type": "timeseries",
+      "targets": [
+        {
+          "expr": "paycore_outbox_unpublished_rows",
+          "legendFormat": "Unpublished Rows"
+        },
+        {
+          "expr": "paycore_outbox_oldest_unpublished_age_seconds",
+          "legendFormat": "Oldest Age (s)"
+        }
+      ],
+      "gridPos": { "h": 6, "w": 9, "x": 6, "y": 0 }
+    },
+    {
+      "id": 3,
+      "title": "Payment State Transitions / sec",
+      "type": "timeseries",
+      "targets": [
+        {
+          "expr": "sum by (from, to) (rate(paycore_payment_transitions_total[1m]))",
+          "legendFormat": "{{from}} -> {{to}}"
+        }
+      ],
+      "gridPos": { "h": 6, "w": 9, "x": 15, "y": 0 }
+    },
+    {
+      "id": 4,
+      "title": "HTTP Endpoint Latency (p50 / p95 / p99)",
+      "type": "timeseries",
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.99, sum by (le, uri) (rate(http_server_requests_seconds_bucket[1m])))",
+          "legendFormat": "p99 {{uri}}"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum by (le, uri) (rate(http_server_requests_seconds_bucket[1m])))",
+          "legendFormat": "p95 {{uri}}"
+        }
+      ],
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 6 }
+    },
+    {
+      "id": 5,
+      "title": "Idempotency Decisions by Source (Redis Fast-Path vs Postgres)",
+      "type": "timeseries",
+      "targets": [
+        {
+          "expr": "sum by (result, source) (rate(paycore_idempotency_decisions_total[1m]))",
+          "legendFormat": "{{source}}: {{result}}"
+        }
+      ],
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 6 }
+    }
+  ]
+}

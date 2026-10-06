@@ -1,0 +1,56 @@
+groups:
+  - name: paycore_slo_alerts
+    rules:
+      - alert: PayCoreLedgerInvariantDriftDetected
+        expr: paycore_ledger_invariant_drift_paise != 0
+        for: 0m
+        labels:
+          severity: page
+        annotations:
+          summary: "CRITICAL: Double-entry ledger invariant drift != 0 paise"
+          description: "Ledger invariant checker detected non-zero drift ({{ $value }} paise). Immediate investigation required."
+
+      - alert: PayCoreOutboxRelayLagHigh
+        expr: paycore_outbox_oldest_unpublished_age_seconds > 30
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Outbox relay oldest unpublished event age > 30s"
+          description: "Oldest unpublished row in outbox_events is {{ $value }}s old."
+
+      - alert: PayCorePspCircuitBreakerOpen
+        expr: resilience4j_circuitbreaker_state{name="psp",state="open"} == 1
+        for: 0m
+        labels:
+          severity: critical
+        annotations:
+          summary: "PSP Resilience4j Circuit Breaker is OPEN"
+          description: "Downstream PSP circuit breaker has tripped open due to elevated failures/timeouts."
+
+      - alert: PayCoreWebhookDlqNonZero
+        expr: paycore_webhook_dlq_depth > 0
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Webhook Dead-Letter Queue (DLQ) depth > 0"
+          description: "One or more webhook events exhausted retries or were routed as poison messages."
+
+      - alert: PayCoreCaptureLatencyP99Breach
+        expr: histogram_quantile(0.99, sum(rate(http_server_requests_seconds_bucket{uri="/v1/payments/{id}/capture"}[5m])) by (le)) > 0.150
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Capture p99 latency > 150ms SLO"
+          description: "Capture endpoint p99 latency is {{ $value }}s (SLO <= 0.150s)."
+
+      - alert: PayCore5xxErrorBudgetBurn
+        expr: (sum(rate(http_server_requests_seconds_count{status=~"5.."}[5m])) / sum(rate(http_server_requests_seconds_count[5m]))) > 0.01
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "HTTP 5xx error rate > 1% burn rate"
+          description: "PayCore 5xx error ratio is burning the 99.95% availability error budget."

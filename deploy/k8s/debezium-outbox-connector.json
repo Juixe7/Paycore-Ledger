@@ -1,0 +1,30 @@
+{
+  "name": "paycore-outbox-cdc-connector-v2",
+  "config": {
+    "connector.class": "io.debezium.connector.postgresql.PostgresConnector",
+    "tasks.max": "1",
+    "plugin.name": "pgoutput",
+    "database.hostname": "paycore-pg-rw.paycore.svc.cluster.local",
+    "database.port": "5432",
+    "database.user": "paycore",
+    "database.password": "${file:/secrets/pg-credentials:password}",
+    "database.dbname": "paycore",
+    "topic.prefix": "paycore.cdc",
+    "table.include.list": "public.outbox_events",
+    "slot.name": "paycore_outbox_debezium_slot",
+    "publication.name": "paycore_outbox_pub",
+    "publication.autocreate.mode": "filtered",
+    "tombstones.on.delete": "false",
+    "transforms": "outbox",
+    "transforms.outbox.type": "io.debezium.transforms.outbox.EventRouter",
+    "transforms.outbox.table.field.event.id": "id",
+    "transforms.outbox.table.field.event.key": "aggregate_id",
+    "transforms.outbox.table.field.event.type": "event_type",
+    "transforms.outbox.table.field.event.payload": "payload",
+    "transforms.outbox.route.by.field": "event_type",
+    "transforms.outbox.route.topic.replacement": "payments.events",
+    "transforms.outbox.table.expand.json.payload": "false",
+    "value.converter": "org.apache.kafka.connect.converters.ByteArrayConverter",
+    "header.converter": "org.apache.kafka.connect.storage.SimpleHeaderConverter"
+  }
+}
