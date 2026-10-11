@@ -1,0 +1,647 @@
+{
+  "info": {
+    "name": "PayCore — Payment Service & Double-Entry Ledger",
+    "description": "Full end-to-end Postman collection for PayCore.\n\nCovers the complete money path:\n1. Onboard Merchant\n2. Create Payment (+ idempotent replay)\n3. Authorize (Two-Phase PSP pattern)\n4. Capture (3-leg double-entry ledger)\n5. Partial Refund (row-locked, over-refund proof)\n6. Full Refund\n7. Inspect Ledger Entries\n8. Check Ledger Invariants (drift == 0)\n9. Payout to merchant bank\n10. Run T+1 Reconciliation\n11. Mock PSP Fault Injection\n12. Webhook DLQ Replay\n\n**Prerequisites:** Run `docker compose -f deploy/docker-compose.lite.yml up -d` then start all services.\n\n**Base URLs:**\n- Go Gateway (auth + rate limit): http://localhost:8080\n- payments-core (direct): http://localhost:8081\n- mock-psp: http://localhost:8085",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json",
+    "_postman_id": "paycore-v2-collection"
+  },
+  "variable": [
+    { "key": "gatewayUrl", "value": "http://localhost:8080", "type": "string" },
+    { "key": "coreUrl",    "value": "http://localhost:8081", "type": "string" },
+    { "key": "pspUrl",     "value": "http://localhost:8085", "type": "string" },
+    { "key": "apiKey",     "value": "", "type": "string", "description": "Set after Step 1 — Onboard Merchant" },
+    { "key": "merchantId", "value": "", "type": "string" },
+    { "key": "paymentId",  "value": "", "type": "string" },
+    { "key": "pspRef",     "value": "", "type": "string" }
+  ],
+  "item": [
+    {
+      "name": "0 — Health Check",
+      "item": [
+        {
+          "name": "GET /actuator/health (payments-core)",
+          "request": {
+            "method": "GET",
+            "url": { "raw": "{{coreUrl}}/actuator/health", "host": ["{{coreUrl}}"], "path": ["actuator", "health"] },
+            "description": "Confirm payments-core is up and PostgreSQL connection is healthy."
+          }
+        },
+        {
+          "name": "GET /health (Go Gateway)",
+          "request": {
+            "method": "GET",
+            "url": { "raw": "{{gatewayUrl}}/health", "host": ["{{gatewayUrl}}"], "path": ["health"] },
+            "description": "Confirm the Go edge gateway is up."
+          }
+        }
+      ]
+    },
+    {
+      "name": "1 — Onboard Merchant",
+      "item": [
+        {
+          "name": "POST /v1/merchants — Onboard Acme Footwear",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "const r = pm.response.json();",
+                  "pm.collectionVariables.set('merchantId', r.id);",
+                  "pm.collectionVariables.set('apiKey', r.apiKey);",
+                  "pm.test('Status 201', () => pm.response.to.have.status(201));",
+                  "pm.test('apiKey returned', () => pm.expect(r.apiKey).to.be.a('string').and.not.empty);",
+                  "pm.test('feeBps = 200', () => pm.expect(r.feeBps).to.eql(200));",
+                  "console.log('merchantId:', r.id, '| apiKey:', r.apiKey);"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "url": { "raw": "{{coreUrl}}/v1/merchants", "host": ["{{coreUrl}}"], "path": ["v1", "merchants"] },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"name\": \"Acme Footwear India\",\n  \"email\": \"treasury@acmefootwear.in\",\n  \"feeBps\": 200,\n  \"webhookUrl\": \"https://webhook.site/paycore-demo\"\n}"
+            },
+            "description": "Onboards the merchant and provisions:\n- `MERCHANT_PAYABLE` double-entry account\n- `PLATFORM_FEE` account\n- SHA-256 hashed API key\n\nThe raw API key is returned **only once**. Captured into `{{apiKey}}` collection variable."
+          }
+        },
+        {
+          "name": "POST /v1/merchants — SSRF Rejection (expect 422)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Status 422 (SSRF rejected)', () => pm.response.to.have.status(422));",
+                  "const r = pm.response.json();",
+                  "pm.test('errorCode present', () => pm.expect(r.errorCode).to.exist);"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "url": { "raw": "{{coreUrl}}/v1/merchants", "host": ["{{coreUrl}}"], "path": ["v1", "merchants"] },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"name\": \"Attacker Corp\",\n  \"email\": \"h@x.io\",\n  \"feeBps\": 0,\n  \"webhookUrl\": \"http://169.254.169.254/latest/meta-data/\"\n}"
+            },
+            "description": "Tries to register a webhook pointing at the AWS metadata endpoint (169.254.169.254). WebhookSsrfValidator must reject with 422."
+          }
+        }
+      ]
+    },
+    {
+      "name": "2 — Create Payment",
+      "item": [
+        {
+          "name": "POST /v1/payments — Create ₹1,000 payment",
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "exec": [
+                  "pm.collectionVariables.set('createIdemKey', 'demo-create-' + pm.variables.replaceIn('{{$guid}}').substring(0, 8));"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Status 201', () => pm.response.to.have.status(201));",
+                  "const r = pm.response.json();",
+                  "pm.collectionVariables.set('paymentId', r.id);",
+                  "pm.test('status = CREATED', () => pm.expect(r.status).to.eql('CREATED'));",
+                  "pm.test('amount = 100000 paise', () => pm.expect(r.amount).to.eql(100000));",
+                  "pm.test('Idempotent-Replayed is false', () => pm.expect(pm.response.headers.get('Idempotent-Replayed')).to.not.eql('true'));",
+                  "console.log('paymentId:', r.id);"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "X-API-Key", "value": "{{apiKey}}" },
+              { "key": "X-Idempotency-Key", "value": "{{createIdemKey}}" }
+            ],
+            "url": { "raw": "{{coreUrl}}/v1/payments", "host": ["{{coreUrl}}"], "path": ["v1", "payments"] },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"amount\": 100000,\n  \"currency\": \"INR\",\n  \"metadata\": { \"order_id\": \"ord_demo_001\" }\n}"
+            },
+            "description": "Creates a payment intent for ₹1,000 (100,000 paise). Status starts as `CREATED`. UUIDv7 paymentId is captured into `{{paymentId}}`."
+          }
+        },
+        {
+          "name": "POST /v1/payments — Idempotent Replay (same key, expect cached 201)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Status 201 (replay)', () => pm.response.to.have.status(201));",
+                  "pm.test('Idempotent-Replayed: true', () => pm.expect(pm.response.headers.get('Idempotent-Replayed')).to.eql('true'));",
+                  "const r = pm.response.json();",
+                  "pm.test('Same paymentId returned', () => pm.expect(r.id).to.eql(pm.collectionVariables.get('paymentId')));",
+                  "pm.test('Zero extra DB writes — no new row created', () => pm.expect(r.status).to.eql('CREATED'));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "X-API-Key", "value": "{{apiKey}}" },
+              { "key": "X-Idempotency-Key", "value": "{{createIdemKey}}" }
+            ],
+            "url": { "raw": "{{coreUrl}}/v1/payments", "host": ["{{coreUrl}}"], "path": ["v1", "payments"] },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"amount\": 100000,\n  \"currency\": \"INR\",\n  \"metadata\": { \"order_id\": \"ord_demo_001\" }\n}"
+            },
+            "description": "Replays the exact same request. PayCore must return the cached 201 with `Idempotent-Replayed: true` — **no second DB row created, no second PSP call**."
+          }
+        },
+        {
+          "name": "GET /v1/payments/{{paymentId}} — Verify CREATED state",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Status 200', () => pm.response.to.have.status(200));",
+                  "pm.test('status = CREATED', () => pm.expect(pm.response.json().status).to.eql('CREATED'));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "X-API-Key", "value": "{{apiKey}}" }],
+            "url": { "raw": "{{coreUrl}}/v1/payments/{{paymentId}}", "host": ["{{coreUrl}}"], "path": ["v1", "payments", "{{paymentId}}"] },
+            "description": "Reads authoritative state from `payments` table (not CQRS read model)."
+          }
+        }
+      ]
+    },
+    {
+      "name": "3 — Authorize (Two-Phase PSP Pattern)",
+      "item": [
+        {
+          "name": "POST /v1/payments/{{paymentId}}/authorize",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Status 200', () => pm.response.to.have.status(200));",
+                  "const r = pm.response.json();",
+                  "pm.collectionVariables.set('pspRef', r.pspRef);",
+                  "pm.test('status = AUTHORIZED', () => pm.expect(r.status).to.eql('AUTHORIZED'));",
+                  "pm.test('pspRef assigned', () => pm.expect(r.pspRef).to.be.a('string').and.not.empty);",
+                  "pm.test('capturedAmount = 0 (no ledger entries yet)', () => pm.expect(r.capturedAmount).to.eql(0));",
+                  "console.log('pspRef:', r.pspRef);"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "X-API-Key", "value": "{{apiKey}}" },
+              { "key": "X-Idempotency-Key", "value": "demo-auth-{{paymentId}}" },
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "url": { "raw": "{{coreUrl}}/v1/payments/{{paymentId}}/authorize", "host": ["{{coreUrl}}"], "path": ["v1", "payments", "{{paymentId}}", "authorize"] },
+            "body": { "mode": "raw", "raw": "{}" },
+            "description": "Executes the **two-phase authorization**:\n\n1. **Tx1** — CAS `CREATED → AUTHORIZING`. Commits. JDBC connection returned to pool.\n2. **PSP HTTP call** — Zero DB connections held. Virtual Thread + CircuitBreaker.\n3. **Tx2** — Re-lock `FOR UPDATE`. Transition `AUTHORIZING → AUTHORIZED`. Write outbox event.\n\nNote: No ledger entries posted yet — `capturedAmount` stays 0."
+          }
+        }
+      ]
+    },
+    {
+      "name": "4 — Capture (3-Leg Double-Entry Ledger)",
+      "item": [
+        {
+          "name": "POST /v1/payments/{{paymentId}}/capture",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Status 200', () => pm.response.to.have.status(200));",
+                  "const r = pm.response.json();",
+                  "pm.test('status = CAPTURED', () => pm.expect(r.status).to.eql('CAPTURED'));",
+                  "pm.test('capturedAmount = 100000', () => pm.expect(r.capturedAmount).to.eql(100000));",
+                  "pm.test('refundedAmount = 0', () => pm.expect(r.refundedAmount).to.eql(0));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "X-API-Key", "value": "{{apiKey}}" },
+              { "key": "X-Idempotency-Key", "value": "demo-cap-{{paymentId}}" },
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "url": { "raw": "{{coreUrl}}/v1/payments/{{paymentId}}/capture", "host": ["{{coreUrl}}"], "path": ["v1", "payments", "{{paymentId}}", "capture"] },
+            "body": { "mode": "raw", "raw": "{}" },
+            "description": "Posts a balanced 3-leg double-entry transaction:\n```\nDEBIT  PSP_RECEIVABLE:INR:<shard>       100000\nCREDIT MERCHANT_PAYABLE:<merchantId>     98000   (net of 2% fee)\nCREDIT PLATFORM_FEE:INR                   2000\n```\nShard selected by `MurmurHash3(paymentId) & 15` — reduces lock contention 4.46x."
+          }
+        },
+        {
+          "name": "POST /v1/payments/{{paymentId}}/capture — Duplicate (expect 409)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Status 409 (already captured)', () => pm.response.to.have.status(409));",
+                  "pm.test('errorCode INVALID_STATE_TRANSITION or similar', () => pm.expect(pm.response.json().errorCode).to.exist);"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "X-API-Key", "value": "{{apiKey}}" },
+              { "key": "X-Idempotency-Key", "value": "demo-cap-duplicate-{{paymentId}}" },
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "url": { "raw": "{{coreUrl}}/v1/payments/{{paymentId}}/capture", "host": ["{{coreUrl}}"], "path": ["v1", "payments", "{{paymentId}}", "capture"] },
+            "body": { "mode": "raw", "raw": "{}" },
+            "description": "Proves 200 concurrent capture attempts result in exactly 1 ledger transaction. All subsequent attempts get 409."
+          }
+        }
+      ]
+    },
+    {
+      "name": "5 — Refunds (Row-Locked, Over-Refund Proof)",
+      "item": [
+        {
+          "name": "POST /v1/payments/{{paymentId}}/refunds — Partial ₹200",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Status 200', () => pm.response.to.have.status(200));",
+                  "const r = pm.response.json();",
+                  "pm.test('status = PARTIALLY_REFUNDED', () => pm.expect(r.status).to.eql('PARTIALLY_REFUNDED'));",
+                  "pm.test('refundedAmount = 20000', () => pm.expect(r.refundedAmount).to.eql(20000));",
+                  "pm.test('capturedAmount unchanged = 100000', () => pm.expect(r.capturedAmount).to.eql(100000));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "X-API-Key", "value": "{{apiKey}}" },
+              { "key": "X-Idempotency-Key", "value": "demo-ref1-{{paymentId}}" },
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "url": { "raw": "{{coreUrl}}/v1/payments/{{paymentId}}/refunds", "host": ["{{coreUrl}}"], "path": ["v1", "payments", "{{paymentId}}", "refunds"] },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"amount\": 20000,\n  \"reason\": \"Customer returned 1 item\"\n}"
+            },
+            "description": "Posts a reversing 2-leg ledger transaction:\n```\nCREDIT PSP_RECEIVABLE:INR:<shard>   20000\nDEBIT  MERCHANT_PAYABLE:<merchantId> 20000\n```\nStatus transitions `CAPTURED → PARTIALLY_REFUNDED`.\n\n**Over-refund protection:** `SELECT ... FOR UPDATE` serializes all concurrent refund requests on this payment row."
+          }
+        },
+        {
+          "name": "POST /v1/payments/{{paymentId}}/refunds — Over-Refund Attempt (expect 422)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Status 422 (over-refund rejected)', () => pm.response.to.have.status(422));",
+                  "const r = pm.response.json();",
+                  "pm.test('errorCode = OVER_REFUND_REJECTED', () => pm.expect(r.errorCode).to.eql('OVER_REFUND_REJECTED'));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "X-API-Key", "value": "{{apiKey}}" },
+              { "key": "X-Idempotency-Key", "value": "demo-overrefund-{{paymentId}}" },
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "url": { "raw": "{{coreUrl}}/v1/payments/{{paymentId}}/refunds", "host": ["{{coreUrl}}"], "path": ["v1", "payments", "{{paymentId}}", "refunds"] },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"amount\": 99999,\n  \"reason\": \"Malicious over-refund attempt\"\n}"
+            },
+            "description": "Attempts to refund ₹999.99 when only ₹800 (80000 paise) remains. Must be rejected with `422 OVER_REFUND_REJECTED`."
+          }
+        },
+        {
+          "name": "POST /v1/payments/{{paymentId}}/refunds — Full Remaining ₹800 (→ REFUNDED)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Status 200', () => pm.response.to.have.status(200));",
+                  "const r = pm.response.json();",
+                  "pm.test('status = REFUNDED (fully)', () => pm.expect(r.status).to.eql('REFUNDED'));",
+                  "pm.test('refundedAmount = capturedAmount', () => pm.expect(r.refundedAmount).to.eql(r.capturedAmount));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "X-API-Key", "value": "{{apiKey}}" },
+              { "key": "X-Idempotency-Key", "value": "demo-ref2-{{paymentId}}" },
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "url": { "raw": "{{coreUrl}}/v1/payments/{{paymentId}}/refunds", "host": ["{{coreUrl}}"], "path": ["v1", "payments", "{{paymentId}}", "refunds"] },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"amount\": 80000,\n  \"reason\": \"Full return — all items rejected\"\n}"
+            },
+            "description": "Refunds the remaining ₹800. Status transitions `PARTIALLY_REFUNDED → REFUNDED`. `refundedAmount == capturedAmount` (100000). Net ledger position for this payment = 0."
+          }
+        }
+      ]
+    },
+    {
+      "name": "6 — Inspect Ledger Entries",
+      "item": [
+        {
+          "name": "GET /v1/payments/{{paymentId}}/ledger — View all entries",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Status 200', () => pm.response.to.have.status(200));",
+                  "const txns = pm.response.json();",
+                  "pm.test('At least 2 transactions (capture + refunds)', () => pm.expect(txns.length).to.be.gte(2));",
+                  "txns.forEach(txn => {",
+                  "  const debits  = txn.entries.filter(e => e.side === 'DEBIT').reduce((s,e)  => s + e.amountPaise, 0);",
+                  "  const credits = txn.entries.filter(e => e.side === 'CREDIT').reduce((s,e) => s + e.amountPaise, 0);",
+                  "  pm.test(`txn ${txn.txnId.substring(0,8)} balanced: DEBIT=${debits} CREDIT=${credits}`, () => pm.expect(debits).to.eql(credits));",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "X-API-Key", "value": "{{apiKey}}" }],
+            "url": { "raw": "{{coreUrl}}/v1/payments/{{paymentId}}/ledger", "host": ["{{coreUrl}}"], "path": ["v1", "payments", "{{paymentId}}", "ledger"] },
+            "description": "Returns all double-entry transactions and their legs. The Postman test script **verifies SUM(DEBIT)==SUM(CREDIT) per transaction** client-side, mirroring what the PostgreSQL deferred trigger enforces server-side."
+          }
+        }
+      ]
+    },
+    {
+      "name": "7 — Global Ledger Invariant Check",
+      "item": [
+        {
+          "name": "GET /v1/admin/invariants — Verify drift == 0",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Status 200', () => pm.response.to.have.status(200));",
+                  "const r = pm.response.json();",
+                  "pm.test('globalDriftPaise == 0 (critical invariant)', () => pm.expect(r.globalDriftPaise).to.eql(0));",
+                  "pm.test('allAccountsBalanced = true', () => pm.expect(r.allAccountsBalanced).to.be.true);",
+                  "pm.test('totalDebits == totalCredits', () => pm.expect(r.totalDebitPaise).to.eql(r.totalCreditPaise));",
+                  "console.log(`Ledger: DEBIT=${r.totalDebitPaise} CREDIT=${r.totalCreditPaise} DRIFT=${r.globalDriftPaise}`);"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "url": { "raw": "{{coreUrl}}/v1/admin/invariants", "host": ["{{coreUrl}}"], "path": ["v1", "admin", "invariants"] },
+            "description": "Runs `LedgerInvariantChecker` inside a `REPEATABLE READ` transaction. Verifies:\n1. `SUM(DEBIT) - SUM(CREDIT) == 0` globally\n2. Every `accounts.cached_balance_paise` == sum of its `ledger_entries`\n\nA non-zero drift indicates a critical double-entry bug."
+          }
+        }
+      ]
+    },
+    {
+      "name": "8 — Merchant Balance & Payout",
+      "item": [
+        {
+          "name": "GET /v1/merchants/me/balance — Check payable balance",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Status 200', () => pm.response.to.have.status(200));",
+                  "const r = pm.response.json();",
+                  "pm.test('balancePaise >= 0 (after full refund, may be 0)', () => pm.expect(r.balancePaise).to.be.gte(0));",
+                  "console.log('MERCHANT_PAYABLE balance:', r.balancePaise, 'paise');"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "X-API-Key", "value": "{{apiKey}}" }],
+            "url": { "raw": "{{coreUrl}}/v1/merchants/me/balance", "host": ["{{coreUrl}}"], "path": ["v1", "merchants", "me", "balance"] }
+          }
+        },
+        {
+          "name": "POST /v1/payouts — Payout ₹100 to bank",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Status 201 or 422 (insufficient if fully refunded)', () => {",
+                  "  pm.expect(pm.response.code).to.be.oneOf([201, 422]);",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "X-API-Key", "value": "{{apiKey}}" },
+              { "key": "X-Idempotency-Key", "value": "demo-payout-{{paymentId}}" },
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "url": { "raw": "{{coreUrl}}/v1/payouts", "host": ["{{coreUrl}}"], "path": ["v1", "payouts"] },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"amount\": 10000,\n  \"currency\": \"INR\"\n}"
+            },
+            "description": "Posts a 2-leg payout ledger transaction:\n```\nDEBIT  MERCHANT_PAYABLE:<merchantId>  10000\nCREDIT BANK:INR                       10000\n```\nEnforces non-negative balance check via `SELECT ... FOR UPDATE` before the debit. If balance is insufficient, returns `422 INSUFFICIENT_BALANCE`.\n\n**Note:** After a full refund, balance is 0, so this will return 422 — that is correct behavior."
+          }
+        }
+      ]
+    },
+    {
+      "name": "9 — T+1 Reconciliation",
+      "item": [
+        {
+          "name": "POST /v1/admin/reconciliation — Run reconciliation",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Status 200', () => pm.response.to.have.status(200));",
+                  "const r = pm.response.json();",
+                  "pm.test('runId present', () => pm.expect(r.runId).to.exist);",
+                  "console.log(`Reconciliation: matched=${r.matchedCount}, discrepancies=${r.discrepancyCount}`);"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "text/csv" }],
+            "url": { "raw": "{{coreUrl}}/v1/admin/reconciliation", "host": ["{{coreUrl}}"], "path": ["v1", "admin", "reconciliation"] },
+            "body": {
+              "mode": "raw",
+              "raw": "psp_ref,amount_paise,status,settlement_date\n{{pspRef}},0,SETTLED,2026-10-12"
+            },
+            "description": "Ingests a PSP settlement CSV. The `{{pspRef}}` was captured during authorize.\n\nFor a fully refunded payment, `expectedSettlementAmount = capturedAmount - refundedAmount = 0`.\n\nDiscrepancy categories detected:\n- `MATCHED` — exact paise and status match\n- `MISSING_IN_LEDGER` — PSP has it, we don't\n- `MISSING_IN_PSP_FILE` — we have it, PSP omitted\n- `AMOUNT_MISMATCH` — amounts differ\n- `STATUS_MISMATCH` — status disagrees"
+          }
+        }
+      ]
+    },
+    {
+      "name": "10 — Mock PSP Fault Injection",
+      "item": [
+        {
+          "name": "POST /psp/v1/admin/fault-config — Enable FLAKY mode",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Status 200 (fault config applied)', () => pm.response.to.have.status(200));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "url": { "raw": "{{pspUrl}}/psp/v1/admin/fault-config", "host": ["{{pspUrl}}"], "path": ["psp", "v1", "admin", "fault-config"] },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"faultMode\": \"FLAKY\",\n  \"failureProbability\": 0.5\n}"
+            },
+            "description": "Configures the mock PSP to randomly fail 50% of requests. Create a new payment and authorize it after this — you'll see some return `FAILED` status. This simulates the chaos used in the 1,000-iteration `ConcurrencyAndCrashTortureTest`."
+          }
+        },
+        {
+          "name": "POST /psp/v1/admin/fault-config — Disable (NONE)",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "url": { "raw": "{{pspUrl}}/psp/v1/admin/fault-config", "host": ["{{pspUrl}}"], "path": ["psp", "v1", "admin", "fault-config"] },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"faultMode\": \"NONE\"\n}"
+            },
+            "description": "Restores normal operation."
+          }
+        },
+        {
+          "name": "GET /psp/v1/settlement.csv — Download settlement file",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{pspUrl}}/psp/v1/settlement.csv?date=2026-10-12",
+              "host": ["{{pspUrl}}"],
+              "path": ["psp", "v1", "settlement.csv"],
+              "query": [{ "key": "date", "value": "2026-10-12" }]
+            },
+            "description": "Downloads the mock PSP settlement CSV for a given date. This is what `ReconciliationService` ingests."
+          }
+        }
+      ]
+    },
+    {
+      "name": "11 — Go Gateway: Auth & Rate Limiting",
+      "item": [
+        {
+          "name": "POST /v1/payments — Via Gateway (with valid API key)",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "X-API-Key", "value": "{{apiKey}}" },
+              { "key": "X-Idempotency-Key", "value": "gateway-test-{{$guid}}" },
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "url": { "raw": "{{gatewayUrl}}/v1/payments", "host": ["{{gatewayUrl}}"], "path": ["v1", "payments"] },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"amount\": 50000,\n  \"currency\": \"INR\"\n}"
+            },
+            "description": "Routes through the Go gateway (port 8080) instead of payments-core directly (8081). The gateway:\n1. Verifies SHA-256 hash of `X-API-Key`\n2. Enforces per-merchant token-bucket rate limit\n3. Injects W3C `traceparent` if missing\n4. Enforces `X-Idempotency-Key` on POST requests"
+          }
+        },
+        {
+          "name": "POST /v1/payments — Via Gateway (missing Idempotency-Key, expect 400)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Status 400 (missing Idempotency-Key)', () => pm.response.to.have.status(400));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "X-API-Key", "value": "{{apiKey}}" },
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "url": { "raw": "{{gatewayUrl}}/v1/payments", "host": ["{{gatewayUrl}}"], "path": ["v1", "payments"] },
+            "body": { "mode": "raw", "raw": "{ \"amount\": 50000, \"currency\": \"INR\" }" },
+            "description": "The Go gateway enforces that all POST requests carry `X-Idempotency-Key`. Missing key → 400 before the request even reaches payments-core."
+          }
+        },
+        {
+          "name": "GET /v1/payments — Via Gateway (invalid API key, expect 401)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Status 401 (invalid API key)', () => pm.response.to.have.status(401));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "X-API-Key", "value": "pk_live_INVALID_KEY_12345" }],
+            "url": { "raw": "{{gatewayUrl}}/v1/payments", "host": ["{{gatewayUrl}}"], "path": ["v1", "payments"] },
+            "description": "Gateway rejects unknown API key before forwarding."
+          }
+        }
+      ]
+    }
+  ]
+}

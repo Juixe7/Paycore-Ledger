@@ -1,0 +1,1098 @@
+openapi: 3.1.0
+info:
+  title: PayCore Payment Service & Double-Entry Ledger API
+  version: 2.0.0
+  description: |
+    Production-grade Payment Service & Double-Entry Ledger API.
+
+    **Key invariants:**
+    - All monetary values are in integer **minor units** (`paise`, `int64`). ₹1 = 100 paise.
+    - Every state-changing endpoint requires `X-Idempotency-Key` (idempotent replay) and `X-API-Key` (merchant auth).
+    - Errors conform to **RFC 7807** (`application/problem+json`).
+    - `SUM(DEBIT) == SUM(CREDIT)` is enforced by a PostgreSQL deferred constraint trigger at `COMMIT` time.
+    - Refunds are protected by a PostgreSQL `SELECT ... FOR UPDATE` row lock — over-refund is mathematically impossible.
+
+    **Payment Lifecycle:**
+    ```
+    CREATED → AUTHORIZING → AUTHORIZED → CAPTURED → PARTIALLY_REFUNDED → REFUNDED
+                                       ↘ VOIDED
+                          ↘ FAILED
+    ```
+servers:
+  - url: http://localhost:8081
+    description: payments-core (direct)
+  - url: http://localhost:8080
+    description: Go Edge Gateway (rate-limited, auth, W3C traceparent)
+  - url: http://localhost:8085
+    description: mock-psp (fault-injectable PSP simulator)
+
+components:
+  securitySchemes:
+    MerchantApiKey:
+      type: apiKey
+      in: header
+      name: X-API-Key
+      description: SHA-256 hashed merchant API key verified by the Go gateway.
+
+  parameters:
+    IdempotencyKeyHeader:
+      name: X-Idempotency-Key
+      in: header
+      required: true
+      description: >
+        Client-generated unique key (UUID recommended). Identical key + payload replays the cached
+        response without re-executing business logic. Different payload with the same key → 422.
+      schema:
+        type: string
+        minLength: 1
+        maxLength: 128
+        example: "pay_idem_01J9Z3K7M2QDVFBCTXN8GRSW04"
+    TraceparentHeader:
+      name: traceparent
+      in: header
+      required: false
+      description: W3C Trace Context. If absent, the Go gateway generates one.
+      schema:
+        type: string
+        example: "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01"
+    PaymentIdPath:
+      name: id
+      in: path
+      required: true
+      description: UUIDv7 payment identifier (time-ordered, B-Tree friendly).
+      schema:
+        type: string
+        format: uuid
+        example: "01927d5e-3f4a-7e2b-9a0c-6b1d3e5f7c8a"
+
+  schemas:
+    # ── Error ──────────────────────────────────────────────────────────────────
+    ProblemDetail:
+      type: object
+      description: RFC 7807 Problem Details for HTTP APIs
+      required: [type, title, status, detail]
+      properties:
+        type:
+          type: string
+          format: uri
+          example: "https://paycore.io/errors/over-refund-rejected"
+        title:
+          type: string
+          example: "Over-Refund Rejected"
+        status:
+          type: integer
+          example: 422
+        detail:
+          type: string
+          example: "Requested refund of 60000 paise exceeds remaining refundable amount of 50000 paise."
+        instance:
+          type: string
+          example: "/v1/payments/01927d5e-3f4a-7e2b-9a0c-6b1d3e5f7c8a/refunds"
+        errorCode:
+          type: string
+          enum:
+            - OVER_REFUND_REJECTED
+            - IDEMPOTENCY_KEY_REUSED_WITH_DIFFERENT_PAYLOAD
+            - IDEMPOTENCY_KEY_IN_FLIGHT
+            - INVALID_STATE_TRANSITION
+            - PSP_AUTHORIZATION_FAILED
+            - MERCHANT_NOT_FOUND
+            - PAYMENT_NOT_FOUND
+            - INSUFFICIENT_BALANCE
+          example: "OVER_REFUND_REJECTED"
+        timestamp:
+          type: string
+          format: date-time
+          example: "2026-10-12T15:30:00.000Z"
+
+    # ── Payment Status ─────────────────────────────────────────────────────────
+    PaymentStatus:
+      type: string
+      description: |
+        Terminal and intermediate states of a payment's lifecycle.
+        - `CREATED` → initial state after `POST /v1/payments`
+        - `AUTHORIZING` → set in Tx1 before the external PSP call (crash-safe)
+        - `AUTHORIZED` → PSP hold confirmed, no ledger entries yet
+        - `CAPTURED` → ledger debit posted (3-leg double-entry transaction)
+        - `PARTIALLY_REFUNDED` → one or more partial refunds applied, balance still positive
+        - `REFUNDED` → fully refunded; net ledger position = 0
+        - `VOIDED` → authorization released before capture
+        - `FAILED` → PSP rejected or timed out
+      enum:
+        - CREATED
+        - AUTHORIZING
+        - AUTHORIZED
+        - CAPTURED
+        - PARTIALLY_REFUNDED
+        - REFUNDED
+        - VOIDED
+        - FAILED
+
+    # ── Requests ───────────────────────────────────────────────────────────────
+    CreatePaymentRequest:
+      type: object
+      required: [amount, currency]
+      properties:
+        amount:
+          type: integer
+          format: int64
+          minimum: 1
+          description: Amount in minor units (paise). ₹1,000 = 100000 paise.
+          example: 100000
+        currency:
+          type: string
+          enum: [INR]
+          example: "INR"
+        metadata:
+          type: object
+          additionalProperties: true
+          description: Arbitrary merchant metadata (e.g., order_id, customer_id).
+          example:
+            order_id: "ord_XT92K"
+            customer_id: "cust_88421"
+
+    RefundRequest:
+      type: object
+      required: [amount]
+      description: >
+        Partial or full refund. Protected by `SELECT ... FOR UPDATE` row lock — concurrent over-refund
+        requests are serialized and rejected with 422 `OVER_REFUND_REJECTED`.
+      properties:
+        amount:
+          type: integer
+          format: int64
+          minimum: 1
+          description: Amount to refund in paise. Must be ≤ (capturedAmount − refundedAmount).
+          example: 20000
+        reason:
+          type: string
+          maxLength: 255
+          description: Human-readable refund reason (stored in ledger transaction notes).
+          example: "Customer returned 1 item"
+
+    PayoutRequest:
+      type: object
+      required: [amount, currency]
+      description: >
+        Settle a merchant's accumulated payable balance to their bank account.
+        Enforces `MERCHANT_PAYABLE balance >= amount` with a `SELECT ... FOR UPDATE` check
+        before the ledger debit, preventing negative balance payouts.
+      properties:
+        amount:
+          type: integer
+          format: int64
+          minimum: 1
+          example: 78000
+        currency:
+          type: string
+          enum: [INR]
+          example: "INR"
+
+    OnboardMerchantRequest:
+      type: object
+      required: [name, email, feeBps]
+      properties:
+        name:
+          type: string
+          example: "Acme Footwear India"
+        email:
+          type: string
+          format: email
+          example: "treasury@acmefootwear.in"
+        feeBps:
+          type: integer
+          description: Platform fee in basis points (200 = 2.00%).
+          minimum: 0
+          maximum: 10000
+          example: 200
+        webhookUrl:
+          type: string
+          format: uri
+          description: >
+            Merchant webhook endpoint. Validated for SSRF (rejects loopback, link-local,
+            RFC1918 private ranges, and non-HTTP(S) schemes).
+          example: "https://api.acmefootwear.in/webhooks/paycore"
+
+    # ── Responses ──────────────────────────────────────────────────────────────
+    MerchantResponse:
+      type: object
+      required: [id, name, email, feeBps, apiKey, createdAt]
+      properties:
+        id:
+          type: string
+          format: uuid
+          example: "01927d5a-1b2c-7e3d-8f4e-9a0b1c2d3e4f"
+        name:
+          type: string
+          example: "Acme Footwear India"
+        email:
+          type: string
+          format: email
+          example: "treasury@acmefootwear.in"
+        feeBps:
+          type: integer
+          example: 200
+        apiKey:
+          type: string
+          description: Raw API key — returned only once at onboarding. Store securely.
+          example: "pk_live_AbCd1234EfGh5678IjKl9012"
+        createdAt:
+          type: string
+          format: date-time
+          example: "2026-10-12T14:55:00.000Z"
+
+    PaymentResponse:
+      type: object
+      required: [id, merchantId, amount, currency, status, capturedAmount, refundedAmount, version, createdAt, updatedAt]
+      description: Authoritative payment state read directly from the `payments` table (not the CQRS read model).
+      properties:
+        id:
+          type: string
+          format: uuid
+          description: UUIDv7 — time-ordered, monotonic, B-Tree friendly.
+          example: "01927d5e-3f4a-7e2b-9a0c-6b1d3e5f7c8a"
+        merchantId:
+          type: string
+          format: uuid
+          example: "01927d5a-1b2c-7e3d-8f4e-9a0b1c2d3e4f"
+        amount:
+          type: integer
+          format: int64
+          description: Original payment amount in paise.
+          example: 100000
+        currency:
+          type: string
+          example: "INR"
+        status:
+          $ref: "#/components/schemas/PaymentStatus"
+        pspRef:
+          type: [string, "null"]
+          description: External PSP authorization reference. Null until AUTHORIZED.
+          example: "psp_auth_9KL3M2N1"
+        capturedAmount:
+          type: integer
+          format: int64
+          description: Amount captured and posted to the double-entry ledger (paise).
+          example: 100000
+        refundedAmount:
+          type: integer
+          format: int64
+          description: Cumulative amount refunded so far (paise). Always ≤ capturedAmount.
+          example: 20000
+        version:
+          type: integer
+          description: Optimistic lock version. Increments on every state change.
+          example: 3
+        createdAt:
+          type: string
+          format: date-time
+          example: "2026-10-12T14:55:00.000Z"
+        updatedAt:
+          type: string
+          format: date-time
+          example: "2026-10-12T15:02:30.000Z"
+
+    LedgerEntryResponse:
+      type: object
+      required: [entryId, txnId, accountId, side, amountPaise, currency, createdAt]
+      properties:
+        entryId:
+          type: string
+          format: uuid
+        txnId:
+          type: string
+          format: uuid
+        accountId:
+          type: string
+          description: "e.g. PSP_RECEIVABLE:INR:03, MERCHANT_PAYABLE:01927d5a-..., PLATFORM_FEE:INR"
+          example: "PSP_RECEIVABLE:INR:03"
+        side:
+          type: string
+          enum: [DEBIT, CREDIT]
+        amountPaise:
+          type: integer
+          format: int64
+          example: 100000
+        currency:
+          type: string
+          example: "INR"
+        createdAt:
+          type: string
+          format: date-time
+
+    LedgerTransactionResponse:
+      type: object
+      required: [txnId, paymentId, type, entries, createdAt]
+      properties:
+        txnId:
+          type: string
+          format: uuid
+        paymentId:
+          type: string
+          format: uuid
+        type:
+          type: string
+          enum: [CAPTURE, REFUND, PAYOUT]
+        notes:
+          type: string
+          example: "Capture of 100000 paise for payment 01927d5e-..."
+        entries:
+          type: array
+          items:
+            $ref: "#/components/schemas/LedgerEntryResponse"
+        createdAt:
+          type: string
+          format: date-time
+
+    LedgerInvariantResponse:
+      type: object
+      required: [globalDriftPaise, allAccountsBalanced, checkedAt]
+      properties:
+        globalDriftPaise:
+          type: integer
+          format: int64
+          description: SUM(DEBIT) − SUM(CREDIT) across all ledger_entries. Must be 0.
+          example: 0
+        allAccountsBalanced:
+          type: boolean
+          description: True if every account's cached_balance_paise matches its historical ledger sum.
+          example: true
+        totalDebitPaise:
+          type: integer
+          format: int64
+          example: 4780000
+        totalCreditPaise:
+          type: integer
+          format: int64
+          example: 4780000
+        checkedAt:
+          type: string
+          format: date-time
+
+    ReconciliationRunResponse:
+      type: object
+      required: [runId, settlementDate, matchedCount, discrepancyCount, discrepancies]
+      properties:
+        runId:
+          type: string
+          format: uuid
+        settlementDate:
+          type: string
+          format: date
+          example: "2026-10-11"
+        matchedCount:
+          type: integer
+          example: 1247
+        discrepancyCount:
+          type: integer
+          example: 3
+        discrepancies:
+          type: array
+          items:
+            type: object
+            required: [pspRef, type]
+            properties:
+              pspRef:
+                type: string
+              type:
+                type: string
+                enum:
+                  - MATCHED
+                  - MISSING_IN_LEDGER
+                  - MISSING_IN_PSP_FILE
+                  - AMOUNT_MISMATCH
+                  - STATUS_MISMATCH
+              internalAmountPaise:
+                type: integer
+                format: int64
+              pspAmountPaise:
+                type: integer
+                format: int64
+              internalStatus:
+                $ref: "#/components/schemas/PaymentStatus"
+              pspStatus:
+                type: string
+
+    BalanceResponse:
+      type: object
+      required: [merchantId, balancePaise, currency]
+      properties:
+        merchantId:
+          type: string
+          format: uuid
+        balancePaise:
+          type: integer
+          format: int64
+          description: Current MERCHANT_PAYABLE balance (amount available to payout).
+          example: 78000
+        currency:
+          type: string
+          example: "INR"
+
+    # ── Mock PSP Schemas ───────────────────────────────────────────────────────
+    PspFaultConfig:
+      type: object
+      description: Fault injection configuration for the mock PSP simulator.
+      properties:
+        faultMode:
+          type: string
+          enum: [NONE, HTTP_500, TIMEOUT, FLAKY]
+          description: >
+            NONE = normal; HTTP_500 = always return 500; TIMEOUT = hang forever;
+            FLAKY = random mix of 500s and timeouts (used in 1000-iteration crash torture).
+          example: "FLAKY"
+        failureProbability:
+          type: number
+          format: double
+          minimum: 0
+          maximum: 1
+          description: Probability [0,1] of failure per call when faultMode=FLAKY.
+          example: 0.15
+
+paths:
+  # ── Merchant ───────────────────────────────────────────────────────────────
+  /v1/merchants:
+    post:
+      summary: Onboard a new merchant (provision double-entry accounts + API key)
+      operationId: createMerchant
+      tags: [Merchant]
+      description: >
+        Creates merchant record, provisions `MERCHANT_PAYABLE` and `PLATFORM_FEE` accounts,
+        and returns a one-time raw API key. The API key is SHA-256 hashed before storage.
+        Webhook URL, if provided, is validated against SSRF rules before persisting.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/OnboardMerchantRequest"
+            example:
+              name: "Acme Footwear India"
+              email: "treasury@acmefootwear.in"
+              feeBps: 200
+              webhookUrl: "https://api.acmefootwear.in/webhooks/paycore"
+      responses:
+        "201":
+          description: Merchant onboarded successfully. **Store the `apiKey` — it is shown only once.**
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MerchantResponse"
+              example:
+                id: "01927d5a-1b2c-7e3d-8f4e-9a0b1c2d3e4f"
+                name: "Acme Footwear India"
+                email: "treasury@acmefootwear.in"
+                feeBps: 200
+                apiKey: "pk_live_AbCd1234EfGh5678IjKl9012"
+                createdAt: "2026-10-12T14:55:00.000Z"
+        "422":
+          description: Validation failure or SSRF-rejected webhook URL.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetail"
+
+  /v1/merchants/me/balance:
+    get:
+      summary: Get merchant payable balance (authoritative, not CQRS)
+      operationId: getMerchantBalance
+      tags: [Merchant]
+      security:
+        - MerchantApiKey: []
+      responses:
+        "200":
+          description: Current `MERCHANT_PAYABLE` balance available for payout.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BalanceResponse"
+              example:
+                merchantId: "01927d5a-1b2c-7e3d-8f4e-9a0b1c2d3e4f"
+                balancePaise: 78000
+                currency: "INR"
+
+  /v1/merchants/me/summary:
+    get:
+      summary: Get CQRS Read Model merchant summary (eventually consistent)
+      operationId: getMerchantSummary
+      tags: [Merchant]
+      security:
+        - MerchantApiKey: []
+      description: >
+        Reads from the denormalized `merchant_summary_view` maintained by `read-model-service`.
+        Eventually consistent — may lag behind the authoritative `payments` table by the Kafka
+        event propagation delay (typically <100ms in dev, <5s under load).
+      responses:
+        "200":
+          description: Projected merchant daily summary.
+
+  # ── Payments ───────────────────────────────────────────────────────────────
+  /v1/payments:
+    post:
+      summary: Create a new payment intent (idempotent)
+      operationId: createPayment
+      tags: [Payments]
+      security:
+        - MerchantApiKey: []
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKeyHeader"
+        - $ref: "#/components/parameters/TraceparentHeader"
+      description: >
+        Creates a payment in `CREATED` state. Idempotent — replaying with the same
+        `X-Idempotency-Key` and identical body returns the cached `201` response
+        with `Idempotent-Replayed: true` header and **zero additional DB writes**.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreatePaymentRequest"
+            example:
+              amount: 100000
+              currency: "INR"
+              metadata:
+                order_id: "ord_XT92K"
+      responses:
+        "201":
+          description: Payment intent created in `CREATED` state.
+          headers:
+            Idempotent-Replayed:
+              schema:
+                type: boolean
+              description: "`true` if this response was served from the idempotency cache."
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PaymentResponse"
+              example:
+                id: "01927d5e-3f4a-7e2b-9a0c-6b1d3e5f7c8a"
+                merchantId: "01927d5a-1b2c-7e3d-8f4e-9a0b1c2d3e4f"
+                amount: 100000
+                currency: "INR"
+                status: "CREATED"
+                pspRef: null
+                capturedAmount: 0
+                refundedAmount: 0
+                version: 1
+                createdAt: "2026-10-12T14:55:00.000Z"
+                updatedAt: "2026-10-12T14:55:00.000Z"
+        "409":
+          description: Concurrent in-flight request with the same idempotency key (`IDEMPOTENCY_KEY_IN_FLIGHT`).
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetail"
+        "422":
+          description: Idempotency key reused with a different request body (`IDEMPOTENCY_KEY_REUSED_WITH_DIFFERENT_PAYLOAD`).
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetail"
+
+    get:
+      summary: List payments from CQRS Read Model (UUIDv7 cursor-paginated)
+      operationId: listPayments
+      tags: [Payments]
+      security:
+        - MerchantApiKey: []
+      parameters:
+        - name: cursor
+          in: query
+          description: UUIDv7 of the last payment on the previous page.
+          schema:
+            type: string
+            format: uuid
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            default: 20
+            maximum: 100
+      responses:
+        "200":
+          description: Cursor-paginated page of projected payment views.
+
+  /v1/payments/{id}:
+    get:
+      summary: Get authoritative payment state
+      operationId: getPayment
+      tags: [Payments]
+      security:
+        - MerchantApiKey: []
+      parameters:
+        - $ref: "#/components/parameters/PaymentIdPath"
+      responses:
+        "200":
+          description: Authoritative payment details (read from `payments` table, not CQRS).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PaymentResponse"
+        "404":
+          description: Payment not found.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetail"
+
+  /v1/payments/{id}/authorize:
+    post:
+      summary: Authorize payment (Two-Phase — Tx1 CAS → PSP call → Tx2 settle)
+      operationId: authorizePayment
+      tags: [Payments]
+      security:
+        - MerchantApiKey: []
+      parameters:
+        - $ref: "#/components/parameters/PaymentIdPath"
+        - $ref: "#/components/parameters/IdempotencyKeyHeader"
+      description: |
+        Executes the **two-phase idempotent authorization** pattern:
+        1. **Tx1 (<3ms)** — CAS `status: CREATED → AUTHORIZING`. Commits immediately. JDBC connection returned to pool.
+        2. **External PSP HTTP call** — Zero DB connections held. Runs on JDK 21 Virtual Thread inside Resilience4j CircuitBreaker + Retry + Bulkhead.
+        3. **Tx2 (<4ms)** — Re-locks payment row (`FOR UPDATE`), transitions to `AUTHORIZED` (or `FAILED`), writes `outbox_events` row.
+
+        **Crash safety:** If the server crashes between Tx1 and Tx2, a background `resolveStuckAuthorizingPayments()` task re-queries the PSP after 30s and completes the state transition.
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+      responses:
+        "200":
+          description: Payment authorized (`AUTHORIZED`) or PSP-rejected (`FAILED`).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PaymentResponse"
+              example:
+                id: "01927d5e-3f4a-7e2b-9a0c-6b1d3e5f7c8a"
+                status: "AUTHORIZED"
+                pspRef: "psp_auth_9KL3M2N1"
+                capturedAmount: 0
+                refundedAmount: 0
+                version: 2
+        "409":
+          description: Duplicate capture attempt or idempotency key in-flight.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetail"
+
+  /v1/payments/{id}/capture:
+    post:
+      summary: Capture authorized payment (posts 3-leg double-entry ledger transaction)
+      operationId: capturePayment
+      tags: [Payments]
+      security:
+        - MerchantApiKey: []
+      parameters:
+        - $ref: "#/components/parameters/PaymentIdPath"
+        - $ref: "#/components/parameters/IdempotencyKeyHeader"
+      description: |
+        Posts a balanced 3-leg double-entry ledger transaction:
+        ```
+        DEBIT  PSP_RECEIVABLE:INR:<shard>   100000 paise   (platform receives from PSP)
+        CREDIT MERCHANT_PAYABLE:<merchantId>  98000 paise   (merchant earns, net of 2% fee)
+        CREDIT PLATFORM_FEE:INR               2000 paise   (platform fee revenue)
+        ```
+        The shard is selected by `MurmurHash3(paymentId) & 15` across 16 `PSP_RECEIVABLE` shards,
+        reducing lock contention **4.46x** under concurrent load.
+
+        Protected by idempotency — 200 concurrent capture attempts result in **exactly 1** ledger transaction.
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+      responses:
+        "200":
+          description: Payment captured. Ledger entries posted. `MERCHANT_PAYABLE` balance increased.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PaymentResponse"
+              example:
+                status: "CAPTURED"
+                capturedAmount: 100000
+                refundedAmount: 0
+                version: 3
+        "409":
+          description: Already captured or idempotency key conflict.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetail"
+
+  /v1/payments/{id}/void:
+    post:
+      summary: Void an authorized payment (releases PSP hold, no ledger entries)
+      operationId: voidPayment
+      tags: [Payments]
+      security:
+        - MerchantApiKey: []
+      parameters:
+        - $ref: "#/components/parameters/PaymentIdPath"
+        - $ref: "#/components/parameters/IdempotencyKeyHeader"
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+      responses:
+        "200":
+          description: Payment voided. No ledger entries posted.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PaymentResponse"
+              example:
+                status: "VOIDED"
+                capturedAmount: 0
+                refundedAmount: 0
+                version: 3
+
+  /v1/payments/{id}/refunds:
+    post:
+      summary: Issue partial or full refund (row-locked, over-refund proof)
+      operationId: refundPayment
+      tags: [Payments]
+      security:
+        - MerchantApiKey: []
+      parameters:
+        - $ref: "#/components/parameters/PaymentIdPath"
+        - $ref: "#/components/parameters/IdempotencyKeyHeader"
+      description: |
+        Posts a reversing 3-leg double-entry ledger transaction:
+        ```
+        CREDIT PSP_RECEIVABLE:INR:<shard>   20000 paise   (return to PSP)
+        DEBIT  MERCHANT_PAYABLE:<merchantId>  20000 paise   (clawback from merchant)
+        ```
+        **Over-refund protection:** A `SELECT ... FROM payments WHERE id = ? FOR UPDATE` row
+        lock serializes all concurrent refund requests. Each waking thread re-reads the latest
+        `refunded_amount` before allowing or rejecting. 100 concurrent ₹200 refund requests on a
+        ₹1,000 capture: **exactly 5 succeed**, 95 are rejected with `422 OVER_REFUND_REJECTED`.
+
+        **State transitions:**
+        - `CAPTURED` + partial refund → `PARTIALLY_REFUNDED`
+        - `PARTIALLY_REFUNDED` + partial refund → `PARTIALLY_REFUNDED`
+        - Either + full remaining amount → `REFUNDED`
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RefundRequest"
+            example:
+              amount: 20000
+              reason: "Customer returned 1 item"
+      responses:
+        "200":
+          description: Refund processed. Reversing ledger entries posted.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PaymentResponse"
+              example:
+                status: "PARTIALLY_REFUNDED"
+                capturedAmount: 100000
+                refundedAmount: 20000
+                version: 4
+        "422":
+          description: >
+            Over-refund rejected — requested amount exceeds `capturedAmount − refundedAmount`.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetail"
+              example:
+                type: "https://paycore.io/errors/over-refund-rejected"
+                title: "Over-Refund Rejected"
+                status: 422
+                detail: "Requested refund of 60000 paise exceeds remaining refundable amount of 50000 paise."
+                errorCode: "OVER_REFUND_REJECTED"
+
+  /v1/payments/{id}/ledger:
+    get:
+      summary: Inspect all double-entry ledger transactions and entries for a payment
+      operationId: getPaymentLedger
+      tags: [Payments]
+      security:
+        - MerchantApiKey: []
+      parameters:
+        - $ref: "#/components/parameters/PaymentIdPath"
+      description: >
+        Returns all `ledger_transactions` and their `ledger_entries` legs for this payment.
+        Useful for auditing — you can verify `SUM(DEBIT) == SUM(CREDIT)` for each transaction
+        visually, and see exactly which shard of `PSP_RECEIVABLE` was used.
+      responses:
+        "200":
+          description: All ledger transactions and entries for this payment.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/LedgerTransactionResponse"
+
+  # ── Payouts ────────────────────────────────────────────────────────────────
+  /v1/payouts:
+    post:
+      summary: Execute merchant settlement payout (DEBIT MERCHANT_PAYABLE → CREDIT BANK)
+      operationId: createPayout
+      tags: [Payouts]
+      security:
+        - MerchantApiKey: []
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKeyHeader"
+      description: >
+        Debits `MERCHANT_PAYABLE` and credits `BANK:INR` in a balanced 2-leg ledger transaction.
+        Enforces non-negative balance: `SELECT ... FOR UPDATE` on `MERCHANT_PAYABLE` account,
+        rejects with `422 INSUFFICIENT_BALANCE` if `balance < amount`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/PayoutRequest"
+            example:
+              amount: 78000
+              currency: "INR"
+      responses:
+        "201":
+          description: Payout ledger entry posted. Balance debited.
+        "422":
+          description: Insufficient merchant payable balance.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetail"
+
+  # ── Admin ──────────────────────────────────────────────────────────────────
+  /v1/admin/invariants:
+    get:
+      summary: Run REPEATABLE READ ledger invariant verification (drift must be 0)
+      operationId: checkLedgerInvariants
+      tags: [Admin]
+      description: >
+        Executes `LedgerInvariantChecker` inside a `REPEATABLE READ` snapshot transaction.
+        Computes `SUM(DEBIT) − SUM(CREDIT)` globally and verifies every account's
+        `cached_balance_paise` matches its historical `ledger_entries` sum.
+        A non-zero `globalDriftPaise` indicates a critical financial bug.
+      responses:
+        "200":
+          description: Invariant check report. `globalDriftPaise` must always be `0`.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LedgerInvariantResponse"
+              example:
+                globalDriftPaise: 0
+                allAccountsBalanced: true
+                totalDebitPaise: 4780000
+                totalCreditPaise: 4780000
+                checkedAt: "2026-10-12T15:30:00.000Z"
+
+  /v1/admin/webhooks/{id}/replay:
+    post:
+      summary: Replay a failed or DLQ-transitioned webhook delivery
+      operationId: replayWebhook
+      tags: [Admin]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      description: >
+        Re-attempts delivery for a webhook stuck in `FAILED` or `DLQ` state.
+        Re-fetches the live `webhook_secret` from `merchant_webhook_endpoints` at replay time
+        (not stored in `webhook_deliveries` — fixed security issue).
+      responses:
+        "200":
+          description: Replay outcome (success or updated retry schedule).
+
+  /v1/admin/reconciliation:
+    post:
+      summary: Ingest PSP settlement CSV and detect financial discrepancies
+      operationId: runReconciliation
+      tags: [Admin]
+      description: |
+        Ingests the PSP's T+1 settlement batch and cross-references against the internal ledger
+        snapshot filtered to `updated_at` within the settlement date window.
+
+        **Discrepancy categories:**
+        | Type | Meaning |
+        |---|---|
+        | `MATCHED` | Amounts and terminal statuses agree to the exact paise |
+        | `MISSING_IN_LEDGER` | PSP settled a charge our ledger never recorded |
+        | `MISSING_IN_PSP_FILE` | Our ledger recorded a capture; PSP file omits it |
+        | `AMOUNT_MISMATCH` | Both have the record but settled amounts differ |
+        | `STATUS_MISMATCH` | Status disagrees (e.g., PSP says `SETTLED`, we say `AUTHORIZED`) |
+
+        Net amount reconciliation: for `PARTIALLY_REFUNDED`/`REFUNDED` payments,
+        `expectedSettlementAmount = capturedAmount − refundedAmount`.
+      requestBody:
+        required: true
+        content:
+          text/csv:
+            schema:
+              type: string
+              description: PSP settlement CSV (psp_ref, amount_paise, status, settlement_date)
+      responses:
+        "200":
+          description: Reconciliation run report.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ReconciliationRunResponse"
+
+  # ── Mock PSP (fault injection) ─────────────────────────────────────────────
+  /psp/v1/authorizations:
+    post:
+      summary: "[Mock PSP] Authorize a payment with the PSP"
+      operationId: pspAuthorize
+      tags: [Mock PSP]
+      description: >
+        Creates a PSP authorization hold. Returns a `pspRef`. Fault injection is controlled via
+        `POST /psp/v1/admin/fault-config`. Used internally by `ResilientPspClient`.
+      responses:
+        "200":
+          description: Authorization result (success or fault-injected failure).
+        "500":
+          description: Fault-injected HTTP 500 (when `faultMode=HTTP_500`).
+
+  /psp/v1/authorizations/{pspRef}:
+    get:
+      summary: "[Mock PSP] Look up authorization status by PSP reference"
+      operationId: pspLookup
+      tags: [Mock PSP]
+      parameters:
+        - name: pspRef
+          in: path
+          required: true
+          schema:
+            type: string
+      description: >
+        Used by `resolveStuckAuthorizingPayments()` to recover payments stuck in `AUTHORIZING`
+        after a crash between Tx1 and Tx2. Returns current PSP status.
+      responses:
+        "200":
+          description: Current PSP authorization status.
+        "404":
+          description: PSP reference not found.
+
+  /psp/v1/captures/{pspRef}:
+    post:
+      summary: "[Mock PSP] Confirm capture of a previously authorized payment"
+      operationId: pspCapture
+      tags: [Mock PSP]
+      parameters:
+        - name: pspRef
+          in: path
+          required: true
+          schema:
+            type: string
+      description: >
+        Called by `ResilientPspClient.capture()` after the ledger transaction is prepared.
+        Records the capture at the PSP level so the T+1 settlement file includes this transaction
+        with status `CAPTURED`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [amountPaise]
+              properties:
+                amountPaise:
+                  type: integer
+                  format: int64
+                  example: 100000
+      responses:
+        "200":
+          description: Capture confirmed by mock PSP.
+
+  /psp/v1/refunds/{pspRef}:
+    post:
+      summary: "[Mock PSP] Issue a refund at the PSP level"
+      operationId: pspRefund
+      tags: [Mock PSP]
+      parameters:
+        - name: pspRef
+          in: path
+          required: true
+          schema:
+            type: string
+      description: >
+        Called by `ResilientPspClient.refund()`. Records the refund against the PSP authorization
+        so the settlement file reflects the net settled amount.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [amountPaise, reason]
+              properties:
+                amountPaise:
+                  type: integer
+                  format: int64
+                  example: 20000
+                reason:
+                  type: string
+                  example: "Customer returned 1 item"
+      responses:
+        "200":
+          description: Refund confirmed by mock PSP.
+
+  /psp/v1/admin/fault-config:
+    post:
+      summary: "[Mock PSP] Configure fault injection mode"
+      operationId: pspSetFaultConfig
+      tags: [Mock PSP]
+      description: >
+        Controls the fault injection mode for the mock PSP. Used by `ConcurrencyAndCrashTortureTest`
+        to inject `FLAKY` mode (15% HTTP 500, 10% timeout) for the 1,000-iteration crash loop.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/PspFaultConfig"
+            example:
+              faultMode: "FLAKY"
+              failureProbability: 0.15
+      responses:
+        "200":
+          description: Fault config applied.
+
+  /psp/v1/settlement.csv:
+    get:
+      summary: "[Mock PSP] Download T+1 settlement CSV"
+      operationId: pspSettlementCsv
+      tags: [Mock PSP]
+      description: >
+        Returns a CSV with all captured (and net-refunded) transactions for the settlement date.
+        Ingested by `ReconciliationService` in `POST /v1/admin/reconciliation`.
+      parameters:
+        - name: date
+          in: query
+          required: true
+          schema:
+            type: string
+            format: date
+            example: "2026-10-11"
+      responses:
+        "200":
+          description: Settlement CSV.
+          content:
+            text/csv:
+              schema:
+                type: string
+              example: |
+                psp_ref,amount_paise,status,settlement_date
+                psp_auth_9KL3M2N1,80000,SETTLED,2026-10-11
