@@ -83,6 +83,14 @@ public class PaymentService {
         this.naiveUnlockedRefundMode = naiveUnlockedRefundMode;
     }
 
+    /**
+     * Initializes a new payment intent with {@code CREATED} state in minor currency units (paise).
+     *
+     * @param merchantId authenticated merchant identifier owning this payment
+     * @param request creation parameters including positive amount in minor units, currency, and optional metadata
+     * @return persisted {@link Payment} aggregate record in {@code CREATED} state
+     * @throws PayCoreException if amount is non-positive (422 INVALID_AMOUNT) or currency is unsupported
+     */
     @Transactional(isolation = Isolation.READ_COMMITTED)
     public Payment createPayment(UUID merchantId, CreatePaymentRequest request) {
         if (request.amount() <= 0) {
@@ -119,14 +127,23 @@ public class PaymentService {
     }
 
     /**
-     * Authorize flow (Section 4.3):
+     * Orchestrates a Two-Phase idempotent authorization against an external PSP.
+     *
+     * <p>Execution phases:
      * <ol>
-     *   <li>Tx 1: Compare-and-set {@code CREATED -> AUTHORIZING} and commit immediately.</li>
-     *   <li>Call PSP outside any DB transaction with deterministic {@code psp_ref = payment_id + ":" + attempt_no}.</li>
-     *   <li>Tx 2: On success -> {@code AUTHORIZED} + attempt row + outbox {@code payment.authorized}.
-     *       On decline -> {@code FAILED} + attempt row + outbox {@code payment.failed}.
-     *       On timeout -> stays {@code AUTHORIZING} for the background resolver job.</li>
+     *   <li><b>Tx 1 (Local):</b> Compare-and-set {@code CREATED -> AUTHORIZING} and commit immediately,
+     *       releasing the JDBC connection back to HikariCP before network I/O.</li>
+     *   <li><b>External I/O (Virtual Thread):</b> Calls the external PSP with deterministic reference
+     *       {@code psp_ref = payment_id + ":" + attempt_no}. Resilience4j CircuitBreaker and Bulkhead enforce fault isolation.</li>
+     *   <li><b>Tx 2 (Local):</b> On {@code AUTHORIZED}, updates state and inserts outbox {@code payment.authorized}.
+     *       On {@code DECLINED}, marks {@code FAILED} and emits {@code payment.failed}.
+     *       On timeout or connection drop, payment remains {@code AUTHORIZING} for background resolution.</li>
      * </ol>
+     *
+     * @param merchantId authenticated merchant identifier owning the payment
+     * @param paymentId UUIDv7 identifier of the payment to authorize
+     * @return updated {@link Payment} aggregate
+     * @throws PayCoreException if payment is in an illegal transition state (409 INVALID_STATE_TRANSITION)
      */
     public Payment authorizePayment(UUID merchantId, UUID paymentId) {
         // Step 1: Tx 1 - Claim payment in CREATED -> AUTHORIZING and commit before network I/O
@@ -270,10 +287,17 @@ public class PaymentService {
     }
 
     /**
-     * Capture flow (Tx 3 - Section 4.3):
-     * Locks the payment row ({@code SELECT ... FOR UPDATE}), checks {@code AUTHORIZED},
-     * posts the balanced double-entry ledger transaction, moves to {@code CAPTURED},
-     * and inserts outbox {@code payment.captured}, all in one atomic commit.
+     * Executes atomic settlement capture (Tx 3), posting balanced 3-leg entries to the double-entry ledger.
+     *
+     * <p>Acquires an exclusive row-level lock ({@code SELECT ... FOR UPDATE}) on the payment,
+     * verifies {@code AUTHORIZED} status, executes PSP capture I/O, invokes {@link com.paycore.payments.ledger.LedgerService#post},
+     * advances state to {@code CAPTURED}, and writes the outbox event in the same ACID commit.
+     *
+     * @param merchantId authenticated merchant identifier
+     * @param paymentId UUIDv7 payment identifier to capture
+     * @param merchantFeeBps platform commission in basis points (e.g. 200 = 2.00%)
+     * @return updated {@link Payment} aggregate in {@code CAPTURED} state
+     * @throws PayCoreException if payment is not in {@code AUTHORIZED} state (409 INVALID_STATE_TRANSITION)
      */
     @Transactional(isolation = Isolation.READ_COMMITTED)
     public Payment capturePayment(UUID merchantId, UUID paymentId, int merchantFeeBps) {
@@ -324,6 +348,14 @@ public class PaymentService {
         return getPayment(merchantId, paymentId);
     }
 
+    /**
+     * Voids an authorized payment hold before capture occurs.
+     *
+     * @param merchantId authenticated merchant identifier
+     * @param paymentId UUIDv7 payment identifier to void
+     * @return updated {@link Payment} aggregate in {@code VOIDED} state
+     * @throws PayCoreException if payment is not in {@code AUTHORIZED} state (409 INVALID_STATE_TRANSITION)
+     */
     @Transactional(isolation = Isolation.READ_COMMITTED)
     public Payment voidPayment(UUID merchantId, UUID paymentId) {
         Payment locked = lockPaymentRow(merchantId, paymentId);
@@ -347,14 +379,18 @@ public class PaymentService {
     }
 
     /**
-     * Refund flow (Section 4.3 & Section 7.2):
-     * Locks the payment row ({@code SELECT ... FOR UPDATE}), validates
-     * {@code refunded_amount + amount <= captured_amount}, posts reversing ledger entries,
-     * updates the running total and status ({@code PARTIALLY_REFUNDED} or {@code REFUNDED}),
-     * and emits {@code refund.processed}.
+     * Executes atomic partial or full refund protected by pessimistic row locking ({@code SELECT ... FOR UPDATE}).
      *
-     * <p>Also includes a toggleable {@code naiveUnlockedRefundMode} (Section 7.2) that skips
-     * {@code FOR UPDATE} to demonstrate why check-then-act without row locks fails under concurrency.
+     * <p>Enforces invariant: {@code refunded_amount + request.amount() <= captured_amount}.
+     * Transitions state to {@code PARTIALLY_REFUNDED} or {@code REFUNDED} using a database CASE statement,
+     * posts reversing ledger entries ({@code DEBIT MERCHANT_PAYABLE}, {@code CREDIT PSP_RECEIVABLE}),
+     * and emits {@code refund.processed} via transactional outbox.
+     *
+     * @param merchantId authenticated merchant identifier
+     * @param paymentId UUIDv7 payment identifier to refund
+     * @param request refund request containing positive minor-unit amount and optional reason
+     * @return {@link RefundResponse} containing cumulative refund state and remaining refundable headroom
+     * @throws PayCoreException if amount is invalid, status is not refundable, or request exceeds captured total (422 OVER_REFUND_REJECTED)
      */
     @Transactional(isolation = Isolation.READ_COMMITTED)
     public RefundResponse refundPayment(UUID merchantId, UUID paymentId, RefundRequest request) {
@@ -465,8 +501,15 @@ public class PaymentService {
     }
 
     /**
-     * Payout flow (FR5 & Section 5.1):
-     * Moves merchant payable balance to simulated BANK account and emits {@code payout.created}.
+     * Executes merchant withdrawal (payout), posting double-entry entries from {@code MERCHANT_PAYABLE} to {@code BANK}.
+     *
+     * <p>Decrements the merchant's liability balance, creates a completed {@link PayoutResponse},
+     * and inserts {@code payout.created} outbox event in the same atomic transaction.
+     *
+     * @param merchantId authenticated merchant identifier withdrawing funds
+     * @param request payout parameters containing positive minor-unit amount and currency
+     * @return {@link PayoutResponse} confirming settlement reference and linked ledger transaction ID
+     * @throws PayCoreException if amount is non-positive (422 INVALID_PAYOUT_AMOUNT) or balance is insufficient
      */
     @Transactional(isolation = Isolation.READ_COMMITTED)
     public PayoutResponse createPayout(UUID merchantId, PayoutRequest request) {
@@ -501,15 +544,24 @@ public class PaymentService {
     }
 
     /**
-     * Background Resolver for Unknown Outcomes / Stuck AUTHORIZING payments (Section 4.3 & Section 7.5).
-     * Queries the PSP by {@code psp_ref} for payments stuck in {@code AUTHORIZING} beyond the threshold
-     * and converges them without guessing or double-charging.
+     * Periodic background reconciliation for in-flight authorizations stuck due to network drops or timeouts.
+     *
+     * <p>Queries the external PSP status by {@code psp_ref} for payments remaining in {@code AUTHORIZING}
+     * beyond the threshold window, converging state deterministically to {@code AUTHORIZED} or {@code FAILED}.
+     *
+     * @return count of payments successfully resolved in this sweep
      */
     @Scheduled(fixedDelayString = "${paycore.resolver.interval-ms:5000}")
     public int resolveStuckAuthorizingPayments() {
         return resolveStuckAuthorizingPayments(Duration.ofSeconds(2));
     }
 
+    /**
+     * Resolves in-flight {@code AUTHORIZING} payments older than the specified duration threshold.
+     *
+     * @param threshold minimum elapsed duration since {@code updated_at} before a payment is eligible for resolution
+     * @return count of payments converged to terminal or authorized state
+     */
     public int resolveStuckAuthorizingPayments(Duration threshold) {
         Instant cutoff = clockProvider.now().minus(threshold);
         List<Payment> stuckPayments = jdbcClient.sql("""

@@ -28,6 +28,10 @@ public class PaymentController {
         this.idempotencyService = idempotencyService;
     }
 
+    /**
+     * Creates an initial payment intent in {@code CREATED} state.
+     * Enforces client idempotency when {@code Idempotency-Key} is supplied.
+     */
     @PostMapping("/v1/payments")
     public ResponseEntity<Payment> createPayment(
             HttpServletRequest httpRequest,
@@ -46,6 +50,9 @@ public class PaymentController {
         return toIdempotentResponse(result);
     }
 
+    /**
+     * Executes two-phase PSP authorization, releasing DB connections before external network I/O.
+     */
     @PostMapping("/v1/payments/{id}/authorize")
     public ResponseEntity<Payment> authorizePayment(
             HttpServletRequest httpRequest,
@@ -66,6 +73,9 @@ public class PaymentController {
         return toIdempotentResponse(result);
     }
 
+    /**
+     * Captures an authorized payment and posts balanced 3-leg entries to the double-entry ledger.
+     */
     @PostMapping("/v1/payments/{id}/capture")
     public ResponseEntity<Payment> capturePayment(
             HttpServletRequest httpRequest,
@@ -86,6 +96,9 @@ public class PaymentController {
         return toIdempotentResponse(result);
     }
 
+    /**
+     * Voids an authorized payment hold before capture.
+     */
     @PostMapping("/v1/payments/{id}/void")
     public ResponseEntity<Payment> voidPayment(
             HttpServletRequest httpRequest,
@@ -106,6 +119,9 @@ public class PaymentController {
         return toIdempotentResponse(result);
     }
 
+    /**
+     * Atomically executes a partial or full refund protected by pessimistic row locking.
+     */
     @PostMapping("/v1/payments/{id}/refunds")
     public ResponseEntity<PaymentService.RefundResponse> refundPayment(
             HttpServletRequest httpRequest,
@@ -126,6 +142,9 @@ public class PaymentController {
         return toIdempotentResponse(result);
     }
 
+    /**
+     * Retrieves the current payment aggregate by ID for the authenticated merchant.
+     */
     @GetMapping("/v1/payments/{id}")
     public ResponseEntity<Payment> getPayment(
             HttpServletRequest httpRequest,
@@ -134,6 +153,9 @@ public class PaymentController {
         return ResponseEntity.ok(paymentService.getPayment(merchantId, paymentId));
     }
 
+    /**
+     * Initiates a merchant balance payout to external bank account.
+     */
     @PostMapping("/v1/payouts")
     public ResponseEntity<PaymentService.PayoutResponse> createPayout(
             HttpServletRequest httpRequest,
