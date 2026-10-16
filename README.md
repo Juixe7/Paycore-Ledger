@@ -11,6 +11,47 @@
 
 ---
 
+## Table of Contents
+
+- [1. Executive Summary](#1-executive-summary)
+  - [1.1 Core Problem Statement](#11-core-problem-statement)
+  - [1.2 Technical Philosophy & Invariants](#12-technical-philosophy--invariants)
+  - [1.3 High-Level Technology Matrix](#13-high-level-technology-matrix)
+- [2. Architecture Overview](#2-architecture-overview)
+  - [2.1 Layered Architectural Diagram](#21-layered-architectural-diagram)
+  - [2.2 Separation of Concerns & Boundary Enforcement](#22-separation-of-concerns--boundary-enforcement)
+- [3. Project Structure](#3-project-structure)
+  - [3.1 Directory Tree](#31-directory-tree)
+  - [3.2 Module Responsibility Matrix](#32-module-responsibility-matrix)
+- [4. Core Features & Subsystems](#4-core-features--subsystems)
+  - [4.1 Two-Phase Idempotent Authorization Pattern](#41-two-phase-idempotent-authorization-pattern)
+  - [4.2 Immutable Double-Entry Ledger Engine & 16-Way Hot Account Sharding](#42-immutable-double-entry-ledger-engine--16-way-hot-account-sharding)
+  - [4.3 Pessimistic Over-Refund Protection](#43-pessimistic-over-refund-protection)
+  - [4.4 Transactional Outbox & Resilient Webhook Pipeline](#44-transactional-outbox--resilient-webhook-pipeline)
+  - [4.5 T+1 Settlement Reconciliation](#45-t1-settlement-reconciliation)
+- [5. Service Layer Documentation](#5-service-layer-documentation)
+- [6. API Documentation](#6-api-documentation)
+  - [6.1 Core Endpoints & Route Definitions](#61-core-endpoints--route-definitions)
+  - [6.2 Key Request & Response DTOs](#62-key-request--response-dtos)
+- [7. Configuration Reference](#7-configuration-reference)
+- [8. Deployment & Setup Guide](#8-deployment--setup-guide)
+  - [8.1 Prerequisites](#81-prerequisites)
+  - [8.2 Step 1: Bootstrapping Infrastructure Stack](#82-step-1-bootstrapping-infrastructure-stack)
+  - [8.3 Step 2: Compiling & Launching Java Microservices](#83-step-2-compiling--launching-java-microservices)
+  - [8.4 Step 3: Launching Go Edge Gateway](#84-step-3-launching-go-edge-gateway)
+  - [8.5 Step 4: Running Automated End-to-End Live Demo](#85-step-4-running-automated-end-to-end-live-demo)
+  - [8.6 Observability & Developer Dashboards](#86-observability--developer-dashboards)
+- [9. Workflow Diagrams](#9-workflow-diagrams)
+  - [9.1 Two-Phase Authorization Workflow](#91-two-phase-authorization-workflow)
+  - [9.2 Capture & 3-Leg Ledger Posting Workflow](#92-capture--3-leg-ledger-posting-workflow)
+  - [9.3 Transactional Outbox to Consumer Event Pipeline](#93-transactional-outbox-to-consumer-event-pipeline)
+- [10. Troubleshooting & Operations Guide](#10-troubleshooting--operations-guide)
+  - [10.1 Diagnostic Triage Matrix](#101-diagnostic-triage-matrix)
+  - [10.2 Inspecting Global Financial Integrity](#102-inspecting-global-financial-integrity)
+- [11. Verification & Empirical Benchmarks](#11-verification--empirical-benchmarks)
+
+---
+
 ## 1. Executive Summary
 
 ### 1.1 Core Problem Statement
